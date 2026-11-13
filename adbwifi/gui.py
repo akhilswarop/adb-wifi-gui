@@ -8,7 +8,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-from . import core, store
+from . import core, qr, store
 
 # A placeholder for the very first start; your own phones live only in %APPDATA%\adb-wifi\phones.json.
 DEFAULT_PHONE = store.Phone(name="My phone", addresses=[])
@@ -64,13 +64,14 @@ class App:
         ttk.Checkbutton(conn, text="Scan all ports (slower)", variable=self.wide_var).grid(row=0, column=1, **pad)
         self.cancel_btn = ttk.Button(conn, text="Cancel", command=self.stop.set, state="disabled")
         self.cancel_btn.grid(row=0, column=2, **pad)
-        ttk.Button(conn, text="Pair...", command=self._pair_dialog).grid(row=0, column=3, **pad)
-        ttk.Button(conn, text="Disconnect", command=self._disconnect).grid(row=0, column=4, **pad)
-        ttk.Button(conn, text="Reset adb", command=self._reset).grid(row=0, column=5, **pad)
+        ttk.Button(conn, text="Pair with QR...", command=self._qr_pair).grid(row=0, column=3, **pad)
+        ttk.Button(conn, text="Pair with code...", command=self._pair_dialog).grid(row=0, column=4, **pad)
+        ttk.Button(conn, text="Disconnect", command=self._disconnect).grid(row=0, column=5, **pad)
+        ttk.Button(conn, text="Reset adb", command=self._reset).grid(row=0, column=6, **pad)
         self.status = ttk.Label(conn, text="Not connected", foreground=GREY, font=("Segoe UI", 11, "bold"))
-        self.status.grid(row=1, column=0, columnspan=6, sticky="w", **pad)
+        self.status.grid(row=1, column=0, columnspan=7, sticky="w", **pad)
         self.warn = ttk.Label(conn, text="", foreground=AMBER, wraplength=760, justify="left")
-        self.warn.grid(row=2, column=0, columnspan=6, sticky="w", **pad)
+        self.warn.grid(row=2, column=0, columnspan=7, sticky="w", **pad)
 
         act = ttk.LabelFrame(self.root, text="Actions")
         act.pack(fill="x", **pad)
@@ -172,6 +173,8 @@ class App:
                 item = self.q.get_nowait()
                 if item[0] == "log":
                     self._log(item[1])
+                elif item[0] == "call":
+                    item[1]()
                 elif item[0] == "poll":
                     _, serial, state = item
                     if serial == self.serial and state != "device" and not self.busy:
@@ -226,6 +229,7 @@ class App:
                 host, port = r.serial.rsplit(":", 1)
                 self.last_ports[host] = int(port)
                 self._set_connected(r.serial, info)
+                self._remember_address(host)
             else:
                 self._set_connected(None)
                 if r.unauthorized:
@@ -233,6 +237,98 @@ class App:
                 elif r.needs_pairing:
                     if messagebox.askyesno("ADB Wi-Fi", "The phone answered but no longer trusts this PC.\n\nPair again now?"):
                         self._pair_dialog(r.serial.rsplit(":", 1)[0] if r.serial else None)
+        self._run(work, done)
+
+    def _remember_address(self, host):
+        """Adds a newly seen address to the selected phone, so the next Connect tries it first."""
+        cur = self.phone()
+        if cur and host not in cur.addresses:
+            cur.addresses.insert(0, host)
+            store.save(self.phones)
+            self._log("Added %s to %s's addresses." % (host, cur.name))
+            self._refresh_phone()
+
+    def _qr_pair(self):
+        """Pairs the way Android Studio does: show a QR code, the phone scans it and announces itself over
+        mDNS, then `adb pair` with the QR's one-time password, then connect."""
+        if self.busy or not self.adb:
+            return self._run(lambda: None)              # shows the usual 'no adb' message if needed
+        name, password, text = core.new_qr_pairing()
+        matrix = qr.encode(text)
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Pair with QR code")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        ttk.Label(dlg, text="On the phone: Settings > Developer options > Wireless debugging >\n"
+                            "Pair device with QR code, then scan this.",
+                  justify="left").pack(padx=12, pady=(10, 4), anchor="w")
+        scale, quiet = 7, 4
+        side = (len(matrix) + 2 * quiet) * scale
+        canvas = tk.Canvas(dlg, width=side, height=side, bg="white", highlightthickness=0)
+        canvas.pack(padx=12, pady=6)
+        for r, row in enumerate(matrix):
+            for c, dark in enumerate(row):
+                if dark:
+                    x, y = (c + quiet) * scale, (r + quiet) * scale
+                    canvas.create_rectangle(x, y, x + scale, y + scale, fill="black", width=0)
+        state = ttk.Label(dlg, text="Waiting for the phone to scan...", foreground=GREY)
+        state.pack(padx=12, pady=4, anchor="w")
+        ttk.Label(dlg, text="The phone and this PC must be on the same Wi-Fi. The code works once and is never saved.",
+                  foreground=GREY, wraplength=side).pack(padx=12, anchor="w")
+        ttk.Button(dlg, text="Cancel", command=lambda: close()).pack(pady=10)
+        p = self.phone()
+        others = list(p.addresses) if p else []
+
+        def show(msg):
+            self.q.put(("call", lambda: state.winfo_exists() and state.config(text=msg)))
+
+        def close():
+            self.stop.set()
+            if dlg.winfo_exists():
+                dlg.destroy()
+        dlg.protocol("WM_DELETE_WINDOW", close)
+        self._log("Showing a pairing QR code (%s). Waiting for the phone to scan it..." % name)
+
+        def work():
+            addr = core.wait_for_pairing_service(self.adb, name, stop=self.stop)
+            if not addr:
+                return None, "cancelled" if self.stop.is_set() else \
+                    "The phone did not show up within 3 minutes. Same Wi-Fi? Try again, or use Pair with code."
+            host, port = addr.rsplit(":", 1)
+            show("Found the phone at %s. Pairing..." % host)
+            self._post_log("The phone scanned the code; pairing with %s..." % addr)
+            ok, out = self.adb.pair(host, int(port), password)
+            self._post_log(out)
+            if not ok:
+                return None, "Pairing failed: " + out
+            show("Paired. Connecting...")
+            r = core.connect_after_pairing(self.adb, host, core.pair_guid(out), stop=self.stop, log=self._post_log)
+            if not r:
+                hosts = [host] + [h for h in others if h != host]
+                r = core.find_and_connect(self.adb, hosts, self.last_ports, stop=self.stop, log=self._post_log)
+            info = ""
+            if r.ok:
+                info = "%s, Android %s, at %s" % (self.adb.getprop(r.serial, "ro.product.model") or "phone",
+                                                  self.adb.getprop(r.serial, "ro.build.version.release") or "?", r.serial)
+            return r, info
+
+        def done(res):
+            r, info = res
+            if dlg.winfo_exists():
+                dlg.destroy()
+            if r is None:
+                self._log(info)
+                if info != "cancelled":
+                    messagebox.showinfo("Pair with QR code", info)
+                return
+            self._log(r.message)
+            if r.ok:
+                host, port = r.serial.rsplit(":", 1)
+                self.last_ports[host] = int(port)
+                self._set_connected(r.serial, info)
+                self._remember_address(host)
+            elif r.unauthorized:
+                messagebox.showinfo("ADB Wi-Fi", "Unlock the phone and tap Allow on the debugging prompt, then press Connect.")
         self._run(work, done)
 
     def _pair_dialog(self, host=None):

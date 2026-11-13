@@ -100,6 +100,53 @@ def parse_mdns(text):
     return found
 
 
+def parse_mdns_named(text):
+    """Like parse_mdns, with the service's instance name first: (name, service type, 'ip:port')."""
+    found = []
+    for line in text.splitlines():
+        m = re.match(r"\s*(\S+)\s+(_adb-tls-(?:connect|pairing)\._tcp)\S*\s+(\d+\.\d+\.\d+\.\d+:\d+)", line)
+        if m:
+            found.append((m.group(1), m.group(2), m.group(3)))
+    return found
+
+
+# ------------------------------------------------------------------ QR pairing (as Android Studio does it)
+# The PC shows a QR code holding a made-up service name and password. The phone scans it, then announces
+# a pairing service under that name over mDNS; the PC finds it and runs `adb pair` with the password.
+
+_QR_ALPHABET = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def new_qr_pairing():
+    """A fresh (service name, password, QR text). Used once; nothing is saved."""
+    import secrets
+    name = "adbwifi-" + "".join(secrets.choice(_QR_ALPHABET) for _ in range(8))
+    password = "".join(secrets.choice(_QR_ALPHABET) for _ in range(12))
+    return name, password, "WIFI:T:ADB;S:%s;P:%s;;" % (name, password)
+
+
+def wait_for_pairing_service(adb, name, stop=None, timeout=180, every=1.0, sleep=None):
+    """Polls adb's mDNS list until the phone announces the pairing service `name`. Returns 'ip:port',
+    or None on timeout or cancel."""
+    import time
+    sleep = sleep or time.sleep
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if stop is not None and stop.is_set():
+            return None
+        for n, kind, addr in adb.discover():
+            if n == name and kind.startswith("_adb-tls-pairing"):
+                return addr
+        sleep(every)
+    return None
+
+
+def pair_guid(text):
+    """The phone's id from adb's 'Successfully paired to ... [guid=adb-XXXX-yyyy]' line, or ''."""
+    m = re.search(r"guid=([^\]\s]+)", text)
+    return m.group(1) if m else ""
+
+
 # ------------------------------------------------------------------ the network
 
 def local_ipv4s():
@@ -119,6 +166,121 @@ def local_ipv4s():
         except OSError:
             pass
     return sorted(ip for ip in ips if not ip.startswith("127."))
+
+
+# ------------------------------------------------------------------ our own mDNS look-up
+# adb's built-in discovery listens for multicast replies, which Windows blocks on a "Public" Wi-Fi and
+# which can go to the wrong network adapter. Asking with the "unicast reply" bit set makes the phone answer
+# straight to our socket, which Windows lets through (a reply to our own question) on every adapter.
+
+MDNS_ADDR = ("224.0.0.251", 5353)
+ADB_SERVICES = ("_adb-tls-pairing._tcp.local", "_adb-tls-connect._tcp.local")
+
+
+def _dns_name(data, off):
+    labels, end = [], None
+    for _ in range(128):
+        n = data[off]
+        if n == 0:
+            off += 1
+            break
+        if n & 0xC0 == 0xC0:                         # a pointer to a name earlier in the packet
+            if end is None:
+                end = off + 2
+            off = ((n & 0x3F) << 8) | data[off + 1]
+            continue
+        labels.append(data[off + 1:off + 1 + n].decode("utf-8", "replace"))
+        off += 1 + n
+    return ".".join(labels), (end if end is not None else off)
+
+
+def mdns_query_packet(services=ADB_SERVICES):
+    import struct
+    body = b""
+    for svc in services:
+        for part in svc.split("."):
+            body += bytes([len(part)]) + part.encode()
+        body += b"\0" + struct.pack(">HH", 12, 0x8001)   # PTR, class IN with the unicast-reply bit
+    return struct.pack(">HHHHHH", 0, 0, len(services), 0, 0, 0) + body
+
+
+def parse_mdns_reply(data, src_ip=None):
+    """The adb services in one mDNS reply: [(instance name, service type, 'ip:port')]."""
+    import struct
+    try:
+        qd, an, ns, ar = struct.unpack(">HHHH", data[4:12])
+        off = 12
+        for _ in range(qd):
+            off = _dns_name(data, off)[1] + 4
+        ptr, srv, addr = [], {}, {}
+        for _ in range(an + ns + ar):
+            name, off = _dns_name(data, off)
+            rtype, _cls, _ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+            off += 10
+            if rtype == 12:
+                ptr.append((name.lower(), _dns_name(data, off)[0]))
+            elif rtype == 33:
+                srv[name.lower()] = (_dns_name(data, off + 6)[0].lower(), struct.unpack(">H", data[off + 4:off + 6])[0])
+            elif rtype == 1 and rdlen == 4:
+                addr[name.lower()] = socket.inet_ntoa(data[off:off + 4])
+            off += rdlen
+    except (IndexError, struct.error):
+        return []
+    found = []
+    for svc, full in ptr:
+        kind = svc[:-len(".local")] if svc.endswith(".local") else svc
+        if not kind.startswith("_adb-tls-"):
+            continue
+        target_port = srv.get(full.lower())
+        if not target_port:
+            continue
+        ip = addr.get(target_port[0]) or src_ip
+        if ip:
+            found.append((full[:-len(svc) - 1] if full.lower().endswith("." + svc) else full, kind,
+                          "%s:%d" % (ip, target_port[1])))
+    return found
+
+
+def mdns_browse(timeout=1.5, interfaces=None):
+    """Asks every network adapter for adb services; returns [(instance name, service type, 'ip:port')]."""
+    import select
+    import time
+    pkt = mdns_query_packet()
+    socks = []
+    for ip in interfaces if interfaces is not None else local_ipv4s():
+        if ip.startswith("169.254."):
+            continue
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(ip))
+            s.bind((ip, 0))
+            s.sendto(pkt, MDNS_ADDR)
+            socks.append(s)
+        except OSError:
+            continue
+    found, end, resent = [], time.monotonic() + timeout, False
+    try:
+        while socks and time.monotonic() < end:
+            if not resent and time.monotonic() > end - timeout / 2:     # one repeat, in case a packet was lost
+                resent = True
+                for s in socks:
+                    try:
+                        s.sendto(pkt, MDNS_ADDR)
+                    except OSError:
+                        pass
+            ready = select.select(socks, [], [], 0.2)[0]
+            for s in ready:
+                try:
+                    data, src = s.recvfrom(9000)
+                except OSError:
+                    continue
+                for item in parse_mdns_reply(data, src[0]):
+                    if item not in found:
+                        found.append(item)
+    finally:
+        for s in socks:
+            s.close()
+    return found
 
 
 def subnet_warning(phone_ip, pc_ips):
@@ -169,9 +331,10 @@ def scan_ports(host, ports=SCAN_PORTS, timeout=0.4, workers=400, stop=None, prog
 class Adb:
     """A thin wrapper around one adb binary. `runner(args, timeout, stdin_text)` can be replaced in tests."""
 
-    def __init__(self, path, runner=None):
+    def __init__(self, path, runner=None, browse=None):
         self.path = path
         self.runner = runner or run_process
+        self.browse = browse or mdns_browse          # our own mDNS look-up (replaced in tests)
 
     def run(self, *args, timeout=20, stdin_text=None):
         return self.runner([self.path, *args], timeout, stdin_text)
@@ -201,6 +364,19 @@ class Adb:
 
     def mdns_services(self):
         return parse_mdns(self.run("mdns", "services", timeout=10)[1])
+
+    def mdns_named(self):
+        return parse_mdns_named(self.run("mdns", "services", timeout=10)[1])
+
+    def discover(self):
+        """Wireless-debugging services seen by our own mDNS look-up, plus whatever adb's discovery has."""
+        found = []
+        for source in (self.browse, self.mdns_named):
+            try:
+                found += [s for s in source() if s not in found]
+            except Exception:
+                pass
+        return found
 
     def getprop(self, serial, name):
         return self.run("-s", serial, "shell", "getprop", name, timeout=10)[1].strip()
@@ -257,6 +433,27 @@ def try_port(adb, host, port):
     return ConnectResult(False, serial, text or "no answer")
 
 
+def connect_after_pairing(adb, host, guid="", stop=None, log=print, wait=10, sleep=None):
+    """Right after a pairing the phone announces its connect port over mDNS (and adb may connect by
+    itself). Waits for either, up to `wait` seconds. Returns a ConnectResult, or None if neither came."""
+    import time
+    sleep = sleep or time.sleep
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline and not (stop is not None and stop.is_set()):
+        for d in adb.devices():                          # adb's own auto-connect
+            if d.state == "device" and (d.host == host or (guid and guid in d.serial)):
+                return ConnectResult(True, d.serial, "connected to %s" % d.serial)
+        for name, kind, addr in adb.discover():
+            if kind.startswith("_adb-tls-connect") and (addr.startswith(host + ":") or (guid and name == guid)):
+                log("Found by mDNS: %s" % addr)
+                h, p = addr.rsplit(":", 1)
+                r = try_port(adb, h, int(p))
+                if r.ok or r.unauthorized:
+                    return r
+        sleep(1)
+    return None
+
+
 def find_and_connect(adb, hosts, last_ports=None, stop=None, log=print, scan=scan_ports, wide=False):
     """Tries, in order: the ports that worked earlier this session, adb's own mDNS discovery, then a
     port scan of each address. Stops at the first working connection."""
@@ -274,17 +471,17 @@ def find_and_connect(adb, hosts, last_ports=None, stop=None, log=print, scan=sca
             pairing_hint = pairing_hint or (r if r.needs_pairing else None)
 
     # 2. mDNS: the phone announces its port on the same Wi-Fi
-    try:
-        services = adb.mdns_services()
-    except Exception:
-        services = []
-    for kind, addr in services:
+    services = [(n, k, a) for n, k, a in adb.discover() if k.startswith("_adb-tls-connect")]
+    # the saved addresses first; then any other phone on the Wi-Fi (its address may have changed). Only a
+    # phone that already trusts this PC accepts the connection, so trying the others is harmless.
+    services.sort(key=lambda s: s[2].rsplit(":", 1)[0] not in hosts)
+    for _name, kind, addr in services:
         host, port = addr.rsplit(":", 1)
-        if kind.startswith("_adb-tls-connect") and host in hosts:
-            log("Found by mDNS: %s" % addr)
-            r = try_port(adb, host, int(port))
-            if r.ok or r.unauthorized:
-                return r
+        log("Found by mDNS: %s%s" % (addr, "" if host in hosts else " (not a saved address)"))
+        r = try_port(adb, host, int(port))
+        if r.ok or r.unauthorized:
+            return r
+        if host in hosts:
             pairing_hint = pairing_hint or (r if r.needs_pairing else None)
 
     # 3. scan each address

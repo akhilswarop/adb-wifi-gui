@@ -14,7 +14,7 @@ class FakeAdb(core.Adb):
 
     def __init__(self, ports, mdns=""):
         self.ports, self.mdns, self.calls, self.connected = ports, mdns, [], {}
-        super().__init__("adb", runner=self.fake)
+        super().__init__("adb", runner=self.fake, browse=lambda: [])
 
     def fake(self, args, timeout, stdin_text=None):
         self.calls.append((args, stdin_text))
@@ -167,6 +167,131 @@ class StoreTests(unittest.TestCase):
 
     def test_missing_file_is_empty(self):
         self.assertEqual(store.load(os.path.join(tempfile.gettempdir(), "nope", "phones.json")), [])
+
+
+class QrPairingTests(unittest.TestCase):
+    MDNS = ("List of discovered mdns services\n"
+            "adbwifi-AbCd2345\t_adb-tls-pairing._tcp\t192.168.50.15:37011\n"
+            "adb-R5CX-abc\t_adb-tls-connect._tcp\t192.168.50.15:40899\n")
+
+    def test_payload_is_the_android_studio_format(self):
+        name, password, text = core.new_qr_pairing()
+        self.assertEqual(text, "WIFI:T:ADB;S:%s;P:%s;;" % (name, password))
+        self.assertTrue(name.startswith("adbwifi-"))
+        self.assertGreaterEqual(len(password), 12)
+        self.assertNotEqual(core.new_qr_pairing()[1], password, "a fresh password every time")
+        for ch in ";:,\\\" ":
+            self.assertNotIn(ch, name + password)
+
+    def test_parse_named(self):
+        self.assertEqual(core.parse_mdns_named(self.MDNS)[0],
+                         ("adbwifi-AbCd2345", "_adb-tls-pairing._tcp", "192.168.50.15:37011"))
+
+    def test_waits_for_our_name_only(self):
+        adb = FakeAdb({}, mdns="other-name\t_adb-tls-pairing._tcp\t192.168.50.99:30000\n")
+        ticks = []
+
+        def sleep(_):
+            ticks.append(1)
+            if len(ticks) == 2:                      # the phone scans on the third poll
+                adb.mdns += self.MDNS
+        self.assertEqual(core.wait_for_pairing_service(adb, "adbwifi-AbCd2345", sleep=sleep), "192.168.50.15:37011")
+        self.assertEqual(len(ticks), 2)
+
+    def test_wait_stops_on_cancel(self):
+        stop = threading.Event()
+        stop.set()
+        self.assertIsNone(core.wait_for_pairing_service(FakeAdb({}), "x", stop=stop))
+
+    def test_password_goes_on_stdin_and_guid_is_read(self):
+        adb = FakeAdb({})
+        ok, out = adb.pair("192.168.50.15", 37011, "Xk7mQ2pL9vRt")
+        self.assertEqual(adb.calls[-1][1], "Xk7mQ2pL9vRt\n")
+        self.assertNotIn("Xk7mQ2pL9vRt", " ".join(adb.calls[-1][0]))
+        self.assertEqual(core.pair_guid(out), "adb-XYZ")
+
+    def test_connects_to_the_announced_port_after_pairing(self):
+        adb = FakeAdb({40899: "adb"}, mdns=self.MDNS)
+        r = core.connect_after_pairing(adb, "192.168.50.15", "adb-R5CX-abc", log=lambda m: None, sleep=lambda s: None)
+        self.assertTrue(r.ok)
+        self.assertEqual(r.serial, "192.168.50.15:40899")
+
+
+def _mdns_reply(instance, service, port, ip):
+    """A phone's mDNS answer: PTR -> SRV -> A, with name compression like Android sends."""
+    import socket
+    import struct
+
+    def name(n):
+        return b"".join(bytes([len(p)]) + p.encode() for p in n.split(".")) + b"\0"
+    svc = name(service)
+    ptr_target = bytes([len(instance)]) + instance.encode() + b"\xc0\x0c"      # instance + pointer to service
+    host = name("Android_TEST.local")
+    srv = struct.pack(">HHH", 0, 0, port) + host
+    pkt = struct.pack(">HHHHHH", 0, 0x8400, 0, 1, 0, 2)
+    pkt += svc + struct.pack(">HHIH", 12, 1, 120, len(ptr_target)) + ptr_target
+    inst_off = 12 + len(svc) + 10
+    pkt += b"\xc0" + bytes([inst_off]) + struct.pack(">HHIH", 33, 0x8001, 120, len(srv)) + srv
+    pkt += host + struct.pack(">HHIH", 1, 0x8001, 120, 4) + socket.inet_aton(ip)
+    return pkt
+
+
+class MdnsTests(unittest.TestCase):
+    def test_parses_a_phone_reply(self):
+        data = _mdns_reply("adb-SERIAL1-abc123", "_adb-tls-connect._tcp.local", 33171, "192.168.50.8")
+        self.assertEqual(core.parse_mdns_reply(data, "192.168.50.8"),
+                         [("adb-SERIAL1-abc123", "_adb-tls-connect._tcp", "192.168.50.8:33171")])
+
+    def test_garbage_is_ignored(self):
+        self.assertEqual(core.parse_mdns_reply(b"\x00\x01\x02", "1.2.3.4"), [])
+
+    def test_query_asks_for_both_services_with_unicast_replies(self):
+        pkt = core.mdns_query_packet()
+        self.assertIn(b"_adb-tls-pairing", pkt)
+        self.assertIn(b"_adb-tls-connect", pkt)
+        self.assertEqual(pkt.count(b"\x00\x0c\x80\x01"), 2)
+
+    def test_connect_finds_the_phone_at_a_new_address(self):
+        adb = FakeAdb({33171: "adb"})
+        adb.browse = lambda: [("adb-SERIAL1-abc", "_adb-tls-connect._tcp", "192.168.50.8:33171")]
+        r = core.find_and_connect(adb, ["192.168.50.15"], log=lambda m: None,
+                                  scan=lambda h, p, stop=None: self.fail("no scan needed"))
+        self.assertTrue(r.ok)
+        self.assertEqual(r.serial, "192.168.50.8:33171")
+
+    def test_qr_wait_uses_our_own_lookup(self):
+        adb = FakeAdb({})
+        adb.browse = lambda: [("adbwifi-Zz", "_adb-tls-pairing._tcp", "192.168.50.8:41234")]
+        self.assertEqual(core.wait_for_pairing_service(adb, "adbwifi-Zz", sleep=lambda s: None), "192.168.50.8:41234")
+
+
+class QrEncoderTests(unittest.TestCase):
+    def test_sizes(self):
+        from adbwifi import qr
+        self.assertEqual(len(qr.encode("A")), 21)
+        self.assertEqual(len(qr.encode(core.new_qr_pairing()[2])), 33)      # version 4
+        with self.assertRaises(ValueError):
+            qr.encode("x" * 300)
+
+    def test_a_camera_can_read_it(self):
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            self.skipTest("OpenCV not installed")
+        from adbwifi import qr
+        det = cv2.QRCodeDetector()
+        for text in ("WIFI:T:ADB;S:adbwifi-AbCd2345;P:Xk7mQ2pL9vRt;;", "y" * 100, "z" * 200):
+            for mask in (None, 0, 3, 7):
+                m = qr.encode(text, mask)
+                n = len(m) + 8
+                img = np.full((n, n), 255, np.uint8)
+                for r, row in enumerate(m):
+                    for c, dark in enumerate(row):
+                        if dark:
+                            img[r + 4, c + 4] = 0
+                img = cv2.resize(img, (n * 8, n * 8), interpolation=cv2.INTER_NEAREST)
+                self.assertEqual(det.detectAndDecode(img)[0], text, "mask %s" % mask)
 
 
 if __name__ == "__main__":
